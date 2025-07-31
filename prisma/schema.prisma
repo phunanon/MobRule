@@ -1,0 +1,27 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./db.db"
+}
+
+model Proposal {
+  id          Int      @id @default(autoincrement())
+  at          DateTime @default(now())
+  guildSf     BigInt
+  plaintiffSf BigInt
+  defendantSf BigInt
+  reason      String
+  votes       Vote[]
+}
+
+model Vote {
+  id          Int      @id @default(autoincrement())
+  at          DateTime @default(now())
+  voterSf     BigInt
+  staff       Boolean
+  proposalId  Int
+  proposal    Proposal @relation(fields: [proposalId], references: [id])
+}
