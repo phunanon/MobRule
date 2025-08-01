@@ -21,6 +21,7 @@ model Vote {
   id          Int      @id @default(autoincrement())
   at          DateTime @default(now())
   voterSf     BigInt
+  voterTag    String
   staff       Boolean
   proposalId  Int
   proposal    Proposal @relation(fields: [proposalId], references: [id])

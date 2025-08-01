@@ -4,7 +4,7 @@ dotenv.config();
 import { PrismaClient } from '@prisma/client';
 import { Client, Guild, Interaction, MessageFlags } from 'discord.js';
 import { ApplicationCommandOptionType, ButtonInteraction } from 'discord.js';
-import { ActionRowBuilder, ButtonBuilder } from 'discord.js';
+import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder } from 'discord.js';
 import { ButtonStyle, CacheType, EmbedBuilder } from 'discord.js';
 import { GatewayIntentBits, IntentsBitField, Partials } from 'discord.js';
 
@@ -28,39 +28,52 @@ const HasHigherRoleThanMe = async (userId: string, guild: Guild) => {
   return true;
 };
 
-const makeFields = (approved: boolean, userIds: BigInt[]) => [
+type User = { sf: BigInt; tag: string; staff: boolean };
+const makeFields = (approved: boolean, users: User[]) => [
   {
     name: 'Staff approved?',
     value: approved ? 'Yes' : 'Not yet',
     inline: true,
   },
   {
-    name: `Supporters (${userIds.length}/3)`,
-    value: userIds.map(id => `<@${id}>`).join('\n'),
+    name: `Supporters (${users.length}/3)`,
+    value: users
+      .map(
+        ({ sf, tag, staff }) =>
+          `${staff ? ':shield: ' : ''}<@${sf}> (\`${tag}\`)`,
+      )
+      .join('\n'),
     inline: true,
   },
 ];
 
-const isExecutable = (approved: boolean, userIds: BigInt[]) =>
-  approved && userIds.length >= 3;
+const isExecutable = <T>(approved: boolean, users: T[]) =>
+  approved && users.length >= 3;
 
 const makeEmbed = (
   plaintiffSf: BigInt,
   defendantSf: BigInt,
   reason: string,
   approved: boolean,
-  userIds: BigInt[],
+  users: User[],
 ) => {
-  const executed = isExecutable(approved, userIds);
+  const executed = isExecutable(approved, users);
   const has = executed ? '' : 'has ';
-  return new EmbedBuilder()
-    .setTitle('Server ban proposal' + (executed ? ' successful' : ''))
-    .setDescription(
-      `<@${plaintiffSf}> ${has}proposed <@${defendantSf}> be banned. Reason:
+  const icon = new AttachmentBuilder('mob.png');
+  return {
+    embeds: [
+      new EmbedBuilder()
+        .setTitle('Server ban proposal' + (executed ? ' successful' : ''))
+        .setDescription(
+          `<@${plaintiffSf}> ${has}proposed <@${defendantSf}> be banned. Reason:
 > ${reason}`,
-    )
-    .setFields(makeFields(approved, userIds))
-    .setColor('Red');
+        )
+        .setFields(makeFields(approved, users))
+        .setThumbnail('attachment://mob.png')
+        .setColor('Red'),
+    ],
+    files: [icon],
+  };
 };
 
 client.once('ready', () => {
@@ -128,21 +141,27 @@ client.once('ready', () => {
     if (plaintiffSf == defendantSf)
       return await interaction.editReply('You cannot propose to ban yourself.');
 
+    if (await HasHigherRoleThanMe(defendant.id, interaction.guild))
+      return await interaction.editReply(
+        'You cannot propose to ban a staff user.',
+      );
+
     const reason = `${interaction.options.get('reason', true)?.value}`;
 
+    const voterTag = plaintiff.tag;
     const proposal = await prisma.proposal.create({
       data: {
         ...{ guildSf, plaintiffSf, defendantSf, reason },
-        votes: { create: { voterSf: plaintiffSf, staff: aboveMe } },
+        votes: { create: { voterSf: plaintiffSf, voterTag, staff: aboveMe } },
       },
     });
 
     const expiresAtSec = Math.ceil(Date.now() / 1000) + 24 * 60 * 60;
     await interaction.editReply({
       content: `Expires <t:${expiresAtSec}:R>`,
-      embeds: [
-        makeEmbed(plaintiffSf, defendantSf, reason, aboveMe, [plaintiffSf]),
-      ],
+      ...makeEmbed(plaintiffSf, defendantSf, reason, aboveMe, [
+        { sf: plaintiffSf, tag: voterTag, staff: aboveMe },
+      ]),
       components: [
         new ActionRowBuilder<ButtonBuilder>().addComponents(
           new ButtonBuilder()
@@ -170,7 +189,7 @@ client.once('ready', () => {
 async function HandleButton(
   interaction: ButtonInteraction<CacheType>,
   guildSf: bigint,
-  aboveMe: boolean,
+  staff: boolean,
 ) {
   const proposalId = Number(interaction.customId.split('-')[1]);
   if (
@@ -208,15 +227,15 @@ async function HandleButton(
 
   //If not staff, check if they have already voted in the past 24h
   const voterSf = BigInt(interaction.user.id);
-  if (!aboveMe) {
+  if (!staff) {
     const votesWindowMs = 24 * 60 * 60_000;
     const windowStartMs = new Date(Date.now() - votesWindowMs);
-    const numVotes = await prisma.vote.count({
+    const [vote] = await prisma.vote.findMany({
       where: { proposalId, voterSf, at: { gte: windowStartMs } },
     });
-    if (numVotes >= 1) {
+    if (vote) {
       const anotherAfterSec = Math.ceil(
-        (votesWindowMs - (Date.now() - windowStartMs.getTime())) / 1000,
+        (vote.at.getTime() + votesWindowMs) / 1000,
       );
       return await interaction.followUp({
         content: `You have already voted in the past 24 hours. You can vote again <t:${anotherAfterSec}:R>.`,
@@ -235,21 +254,46 @@ async function HandleButton(
   }
 
   //Update the message
-  const approved = proposal.votes.some(v => v.staff) || aboveMe;
-  const userIds = [...proposal.votes.map(v => v.voterSf), voterSf];
+  const voterTag = interaction.user.tag;
+  const approved = proposal.votes.some(v => v.staff) || staff;
+  const users = [
+    ...proposal.votes.map(v => ({
+      sf: v.voterSf,
+      tag: v.voterTag,
+      staff: v.staff,
+    })),
+    { sf: voterSf, tag: voterTag, staff },
+  ];
   const { plaintiffSf, defendantSf, reason } = proposal;
-  const executed = isExecutable(approved, userIds);
+  const executed = isExecutable(approved, users);
   await interaction.message.edit({
-    embeds: [makeEmbed(plaintiffSf, defendantSf, reason, approved, userIds)],
+    content: executed
+      ? `<@${defendantSf}> was banned <t:${Math.ceil(Date.now() / 1000)}:R>.`
+      : interaction.message.content,
+    ...makeEmbed(plaintiffSf, defendantSf, reason, approved, users),
     components: executed ? [] : undefined,
   });
 
-  await prisma.vote.create({ data: { proposalId, voterSf, staff: aboveMe } });
+  await prisma.vote.create({ data: { proposalId, voterSf, voterTag, staff } });
 
   await interaction.followUp({
     content: 'Your vote has been recorded.',
     flags: MessageFlags.Ephemeral,
   });
+
+  if (executed) {
+    // If the proposal has been executed, ban the user
+    const guild = await client.guilds.fetch(guildSf.toString());
+    if (!guild) return;
+
+    try {
+      const defendant = await guild.members.fetch(defendantSf.toString());
+      await defendant.ban({ reason: `${interaction.message.url}: ${reason}` });
+      console.log(`Banned ${defendant.user.tag} (${defendantSf})`);
+    } catch (err) {
+      console.error(`Failed to ban user ${defendantSf}:`, err);
+    }
+  }
 }
 
 assert(
