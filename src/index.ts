@@ -28,28 +28,10 @@ const HasHigherRoleThanMe = async (userId: string, guild: Guild) => {
   return true;
 };
 
-type User = { sf: BigInt; tag: string; staff: boolean };
-const makeFields = (approved: boolean, users: User[]) => [
-  {
-    name: 'Staff approved?',
-    value: approved ? 'Yes' : 'Not yet',
-    inline: true,
-  },
-  {
-    name: `Supporters (${users.length}/3)`,
-    value: users
-      .map(
-        ({ sf, tag, staff }) =>
-          `${staff ? ':shield: ' : ''}<@${sf}> (\`${tag}\`)`,
-      )
-      .join('\n'),
-    inline: true,
-  },
-];
-
 const isExecutable = <T>(approved: boolean, users: T[]) =>
   approved && users.length >= 3;
 
+type User = { sf: BigInt; tag: string; staff: boolean };
 const makeEmbed = (
   plaintiffSf: BigInt,
   defendantSf: BigInt,
@@ -60,15 +42,25 @@ const makeEmbed = (
   const executed = isExecutable(approved, users);
   const has = executed ? '' : 'has ';
   const icon = new AttachmentBuilder('mob.png');
+  const needsStaff =
+    !approved && users.length >= 3 ? ' - still needs staff vote' : '';
+  const fields = [
+    {
+      name: `Supporters (${users.length}/3${needsStaff})`,
+      value: users
+        .map(x => `${x.staff ? ':shield: ' : ''}<@${x.sf}> (\`${x.tag}\`)`)
+        .join('\n'),
+    },
+  ];
   return {
     embeds: [
       new EmbedBuilder()
-        .setTitle('Server ban proposal' + (executed ? ' successful' : ''))
+        .setTitle('Server ban ' + (executed ? 'successful' : 'proposed'))
         .setDescription(
           `<@${plaintiffSf}> ${has}proposed <@${defendantSf}> be banned. Reason:
 > ${reason}`,
         )
-        .setFields(makeFields(approved, users))
+        .setFields(fields)
         .setThumbnail('attachment://mob.png')
         .setColor('Red'),
     ],
@@ -186,47 +178,40 @@ client.once('ready', () => {
   });
 });
 
+const flags = MessageFlags.Ephemeral;
 async function HandleButton(
-  interaction: ButtonInteraction<CacheType>,
+  i: ButtonInteraction<CacheType>,
   guildSf: bigint,
   staff: boolean,
 ) {
-  const proposalId = Number(interaction.customId.split('-')[1]);
+  const proposalId = Number(i.customId.split('-')[1]);
   if (
     Number.isNaN(proposalId) ||
     proposalId <= 0 ||
     !Number.isFinite(proposalId) ||
     proposalId !== Math.floor(proposalId)
-  ) {
-    return await interaction.reply({
-      content: 'Invalid proposal.',
-      flags: MessageFlags.Ephemeral,
-    });
-  }
-  await interaction.deferUpdate();
+  )
+    return await i.reply({ content: 'Invalid proposal.', flags });
+  await i.deferUpdate();
+
   const proposal = await prisma.proposal.findFirst({
     where: { id: proposalId, guildSf },
     include: { votes: true },
   });
-  if (!proposal) {
-    return await interaction.followUp({
-      content: 'Proposal not found.',
-      flags: MessageFlags.Ephemeral,
-    });
-  }
+  if (!proposal)
+    return await i.followUp({ content: 'Proposal not found.', flags });
 
   //Check if it has expired
   const expiresAt = new Date(proposal.at.getTime() + 24 * 60 * 60_000);
   if (expiresAt < new Date()) {
     const expiresAtSec = Math.ceil(expiresAt.getTime() / 1000);
-    return await interaction.followUp({
-      content: `This proposal expired <t:${expiresAtSec}:R>.`,
-      flags: MessageFlags.Ephemeral,
-    });
+    const content = `This proposal expired <t:${expiresAtSec}:R>.`;
+    await i.message.edit({ content, components: [] });
+    return await i.followUp({ content, flags });
   }
 
   //If not staff, check if they have already voted in the past 24h
-  const voterSf = BigInt(interaction.user.id);
+  const voterSf = BigInt(i.user.id);
   if (!staff) {
     const votesWindowMs = 24 * 60 * 60_000;
     const windowStartMs = new Date(Date.now() - votesWindowMs);
@@ -237,24 +222,20 @@ async function HandleButton(
       const anotherAfterSec = Math.ceil(
         (vote.at.getTime() + votesWindowMs) / 1000,
       );
-      return await interaction.followUp({
+      return await i.followUp({
         content: `You have already voted in the past 24 hours. You can vote again <t:${anotherAfterSec}:R>.`,
-        flags: MessageFlags.Ephemeral,
+        flags,
       });
     }
   }
 
   //Check if the user has already voted
   const alreadyVoted = proposal.votes.some(v => v.voterSf === voterSf);
-  if (alreadyVoted) {
-    return await interaction.followUp({
-      content: 'You have already voted on this proposal.',
-      flags: MessageFlags.Ephemeral,
-    });
-  }
+  if (alreadyVoted)
+    return await i.followUp({ content: 'You already voted.', flags });
 
   //Update the message
-  const voterTag = interaction.user.tag;
+  const voterTag = i.user.tag;
   const approved = proposal.votes.some(v => v.staff) || staff;
   const users = [
     ...proposal.votes.map(v => ({
@@ -266,20 +247,17 @@ async function HandleButton(
   ];
   const { plaintiffSf, defendantSf, reason } = proposal;
   const executed = isExecutable(approved, users);
-  await interaction.message.edit({
+  await i.message.edit({
     content: executed
       ? `<@${defendantSf}> was banned <t:${Math.ceil(Date.now() / 1000)}:R>.`
-      : interaction.message.content,
+      : i.message.content,
     ...makeEmbed(plaintiffSf, defendantSf, reason, approved, users),
     components: executed ? [] : undefined,
   });
 
   await prisma.vote.create({ data: { proposalId, voterSf, voterTag, staff } });
 
-  await interaction.followUp({
-    content: 'Your vote has been recorded.',
-    flags: MessageFlags.Ephemeral,
-  });
+  await i.followUp({ content: 'Your vote has been recorded.', flags });
 
   if (executed) {
     // If the proposal has been executed, ban the user
@@ -288,7 +266,7 @@ async function HandleButton(
 
     try {
       const defendant = await guild.members.fetch(defendantSf.toString());
-      await defendant.ban({ reason: `${interaction.message.url}: ${reason}` });
+      await defendant.ban({ reason: `${i.message.url}: ${reason}` });
       console.log(`Banned ${defendant.user.tag} (${defendantSf})`);
     } catch (err) {
       console.error(`Failed to ban user ${defendantSf}:`, err);
