@@ -4,8 +4,8 @@ dotenv.config();
 import { PrismaClient } from '@prisma/client';
 import { Client, Guild, Interaction, MessageFlags } from 'discord.js';
 import { ApplicationCommandOptionType, ButtonInteraction } from 'discord.js';
-import { ActionRowBuilder, AttachmentBuilder, ButtonBuilder } from 'discord.js';
-import { ButtonStyle, CacheType, EmbedBuilder } from 'discord.js';
+import { ActionRowBuilder, EmbedBuilder, ButtonBuilder } from 'discord.js';
+import { ButtonStyle, ActivityType, CacheType } from 'discord.js';
 import { GatewayIntentBits, IntentsBitField, Partials } from 'discord.js';
 
 export const prisma = new PrismaClient();
@@ -41,7 +41,6 @@ const makeEmbed = (
 ) => {
   const executed = isExecutable(approved, users);
   const has = executed ? '' : 'has ';
-  const icon = new AttachmentBuilder('mob.png');
   const needsStaff =
     !approved && users.length >= 3 ? ' - still needs staff vote' : '';
   const fields = [
@@ -61,15 +60,33 @@ const makeEmbed = (
 > ${reason}`,
         )
         .setFields(fields)
-        .setThumbnail('attachment://mob.png')
         .setColor('Red'),
     ],
-    files: [icon],
   };
 };
 
+async function SetStatActivity(stat: number) {
+  const numProposals = await prisma.proposal.count();
+  const statList = [
+    `I'm in ${client.guilds.cache.size} servers`,
+    `${numProposals} ban proposals ever`,
+  ];
+  client.user?.setActivity({
+    name: statList[stat]!,
+    type: ActivityType.Custom,
+  });
+  setTimeout(
+    () => SetStatActivity(++stat >= statList.length ? 0 : stat),
+    30_000,
+  );
+}
+
 client.once('ready', () => {
   console.log(`Logged in as ${client.user?.id}`);
+  setTimeout(() => SetStatActivity(0), 30_000);
+  for (const [_, guild] of client.guilds.cache) {
+    console.log(`${guild.id} ${guild.name}`);
+  }
 
   void client.application?.commands.create({
     name: 'propose-ban',
@@ -84,9 +101,10 @@ client.once('ready', () => {
       {
         name: 'reason',
         type: ApplicationCommandOptionType.String,
-        description: 'The reason for the ban proposal',
+        description:
+          'The reason for the ban proposal. Proposal success is more likely with a detailed reason.',
         required: true,
-        minLength: 4,
+        minLength: 16,
       },
     ],
   });
@@ -107,8 +125,8 @@ client.once('ready', () => {
     await interaction.deferReply();
 
     //Check the plaintiff can make another proposal right now
-    //- Staff can make 3 proposals every 1h, others can make 1 every 24h
-    const proposalsWindowMs = aboveMe ? 60 * 60_000 : 24 * 60 * 60_000;
+    //- Staff can make 3 proposals every 1h, others can make 1 every 12h
+    const proposalsWindowMs = aboveMe ? 60 * 60_000 : 12 * 60 * 60_000;
     const windowStartMs = new Date(Date.now() - proposalsWindowMs);
     const maxNumProposalsInWindow = aboveMe ? 3 : 1;
     const numProposals = await prisma.proposal.count({
@@ -116,7 +134,7 @@ client.once('ready', () => {
     });
     if (numProposals >= maxNumProposalsInWindow) {
       const plural = numProposals === 1 ? '' : 's';
-      const window = aboveMe ? 'hour' : '24 hours';
+      const window = aboveMe ? 'hour' : '12 hours';
       await interaction.editReply(
         `You have already made ${numProposals} proposal${plural} in the past ${window}.`,
       );
@@ -210,10 +228,10 @@ async function HandleButton(
     return await i.followUp({ content, flags });
   }
 
-  //If not staff, check if they have already voted in the past 24h
+  //If not staff, check if they have already voted in the past 12h
   const voterSf = BigInt(i.user.id);
   if (!staff) {
-    const votesWindowMs = 24 * 60 * 60_000;
+    const votesWindowMs = 12 * 60 * 60_000;
     const windowStartMs = new Date(Date.now() - votesWindowMs);
     const [vote] = await prisma.vote.findMany({
       where: { proposalId, voterSf, at: { gte: windowStartMs } },
@@ -223,7 +241,7 @@ async function HandleButton(
         (vote.at.getTime() + votesWindowMs) / 1000,
       );
       return await i.followUp({
-        content: `You have already voted in the past 24 hours. You can vote again <t:${anotherAfterSec}:R>.`,
+        content: `You have already voted in the past 12 hours. You can vote again <t:${anotherAfterSec}:R>.`,
         flags,
       });
     }
